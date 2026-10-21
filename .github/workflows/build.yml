@@ -1,11 +1,11 @@
 name: iOS unsigned IPA build
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
       - .github/workflows/ios-ipa.yml
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,10 +14,16 @@ concurrency:
   group: ios-ipa-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PUB_HOSTED_URL: https://pub.dev
+  FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
+
 jobs:
   ios:
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -28,20 +34,97 @@ jobs:
             arguments: '--all-sources'
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: native/go.mod
           cache-dependency-path: native/go.sum
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.47.4'
           channel: stable
           cache: true
-      - name: Ensure CocoaPods
+
+      - name: 0. 环境自检
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          go version
+          python3 --version
+          flutter --version | head -n 2
+
+      - name: 1. 预下载 Go 模块（带重试，隔离 proxy.golang.org 抖动）
+        run: |
+          set -euo pipefail
+          cd native
+          for i in 1 2 3; do
+            if go mod download; then echo "go mod download OK (第 $i 次)"; exit 0; fi
+            echo "第 $i 次失败，15 秒后重试"; sleep 15
+          done
+          echo "go mod download 连续失败" >&2; exit 1
+
+      - name: 2. 安装 CocoaPods
         run: brew list cocoapods --versions || brew install cocoapods
-      - name: Build unsigned iOS packages
-        run: python3 scripts/build_ios.py ${{ matrix.arguments }}
-      - uses: actions/upload-artifact@v4
+
+      - name: 3. 预取 Dart 依赖（enforce-lockfile，带重试）
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            if flutter pub get --enforce-lockfile; then echo "pub get OK (第 $i 次)"; exit 0; fi
+            echo "第 $i 次失败，20 秒后重试"; sleep 20
+          done
+          echo "pub get 连续失败" >&2; exit 1
+
+      - name: 4. 预装 iOS Pods（这一步要联网下载插件二进制，最脆弱，重试 3 次）
+        run: |
+          set -euo pipefail
+          cd ios
+          for i in 1 2 3; do
+            if pod install --repo-update; then echo "pod install OK (第 $i 次)"; exit 0; fi
+            echo "第 $i 次失败，30 秒后重试"; sleep 30
+          done
+          echo "pod install 连续失败" >&2; exit 1
+
+      - name: 5. 构建未签名 IPA（整体再重试一次）
+        run: |
+          set -euo pipefail
+          log="/tmp/ios-build-${{ matrix.edition }}.log"
+          ok=0
+          for i in 1 2; do
+            echo "===== 第 $i 次尝试 =====" | tee -a "$log"
+            if python3 -u scripts/build_ios.py ${{ matrix.arguments }} 2>&1 | tee -a "$log"; then
+              ok=1; break
+            fi
+            echo "第 $i 次失败，20 秒后重试" >&2
+            sleep 20
+          done
+          if [ "$ok" != 1 ]; then exit 1; fi
+
+      - name: 失败时把报错尾部写入 Summary（运行页面直接可见，无需下载日志）
+        if: failure()
+        run: |
+          log="/tmp/ios-build-${{ matrix.edition }}.log"
+          {
+            echo "## ${{ matrix.edition }} 构建失败 — 步骤 5 日志最后 150 行"
+            echo '```text'
+            if [ -f "$log" ]; then tail -n 150 "$log"; else echo "步骤 5 未产生日志，失败发生在更早的命名步骤，请看左侧步骤列表"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: 6. 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-build-log
+          path: /tmp/ios-build-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 7. 上传 IPA 产物
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.edition }}-ios
           path: dist/ios/*
@@ -59,6 +142,7 @@ jobs:
         with:
           pattern: '*-ios'
           path: artifacts
+          merge-multiple: true
       - name: 发布未签名 IPA 到 Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,11 +151,10 @@ jobs:
           version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
           tag="ios-v${version//+/-}"
           mkdir -p rl
-          cp artifacts/*/*.ipa rl/
+          cp artifacts/*.ipa rl/
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" rl/*.ipa --clobber
-            gh release edit "$tag" --title "iOS 未签名 IPA ${version}"
           else
-            printf '%s\n' "未签名 IPA，需用 AltStore / Sideloadly / TrollStore 等工具自签后安装。" "" "红果鉴（仅红果站源）与真果鉴（全部站源）两个版本，功能相同，按需选择。" > notes.md
+            printf '%s\n' "未签名 IPA，需用 AltStore / Sideloadly / TrollStore 等工具自签后安装。" "" "红果鉴（仅红果站源）与真果鉴（全部站源）两个版本。" > notes.md
             gh release create "$tag" rl/*.ipa --title "iOS 未签名 IPA ${version}" --notes-file notes.md
           fi
