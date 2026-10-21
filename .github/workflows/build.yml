@@ -17,8 +17,6 @@ concurrency:
 env:
   GOPROXY: https://proxy.golang.org,direct
   GOSUMDB: sum.golang.org
-  PUB_HOSTED_URL: https://pub.dev
-  FLUTTER_STORAGE_BASE_URL: https://storage.googleapis.com
 
 jobs:
   ios:
@@ -30,8 +28,10 @@ jobs:
         include:
           - edition: hongguojian
             arguments: ''
+            dart_define: 'false'
           - edition: zhenguojian
             arguments: '--all-sources'
+            dart_define: 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +55,7 @@ jobs:
           python3 --version
           flutter --version | head -n 2
 
-      - name: 1. 预下载 Go 模块（带重试，隔离 proxy.golang.org 抖动）
+      - name: 1. 预下载 Go 模块（带重试）
         run: |
           set -euo pipefail
           cd native
@@ -68,16 +68,16 @@ jobs:
       - name: 2. 安装 CocoaPods
         run: brew list cocoapods --versions || brew install cocoapods
 
-      - name: 3. 预取 Dart 依赖（enforce-lockfile，带重试）
+      - name: 3. 拉取 Dart 依赖（普通 pub get，带重试）
         run: |
           set -euo pipefail
           for i in 1 2 3; do
-            if flutter pub get --enforce-lockfile; then echo "pub get OK (第 $i 次)"; exit 0; fi
+            if flutter pub get; then echo "pub get OK (第 $i 次)"; exit 0; fi
             echo "第 $i 次失败，20 秒后重试"; sleep 20
           done
           echo "pub get 连续失败" >&2; exit 1
 
-      - name: 4. 预装 iOS Pods（这一步要联网下载插件二进制，最脆弱，重试 3 次）
+      - name: 4. 预装 iOS Pods（带重试）
         run: |
           set -euo pipefail
           cd ios
@@ -87,29 +87,50 @@ jobs:
           done
           echo "pod install 连续失败" >&2; exit 1
 
-      - name: 5. 构建未签名 IPA（整体再重试一次）
+      - name: 5a. 编译 iOS 原生核心（xcframework，走官方脚本）
+        run: |
+          set -euo pipefail
+          python3 -u scripts/build_ios.py --core-only ${{ matrix.arguments }} \
+            2>&1 | tee "/tmp/ios-build-${{ matrix.edition }}.log"
+
+      - name: 5b. Flutter 构建 + 打包未签名 IPA（绕开脚本内 enforce-lockfile）
         run: |
           set -euo pipefail
           log="/tmp/ios-build-${{ matrix.edition }}.log"
-          ok=0
-          for i in 1 2; do
-            echo "===== 第 $i 次尝试 =====" | tee -a "$log"
-            if python3 -u scripts/build_ios.py ${{ matrix.arguments }} 2>&1 | tee -a "$log"; then
-              ok=1; break
-            fi
-            echo "第 $i 次失败，20 秒后重试" >&2
-            sleep 20
-          done
-          if [ "$ok" != 1 ]; then exit 1; fi
+          version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
+          slug="${{ matrix.edition }}"
+          {
+            echo "===== flutter build ios (ALL_SOURCES=${{ matrix.dart_define }}) ====="
+            flutter build ios --release --no-codesign --no-pub \
+              --dart-define=ALL_SOURCES=${{ matrix.dart_define }}
+            app="build/ios/iphoneos/Runner.app"
+            echo "===== FFI 符号校验 ====="
+            xcrun nm -gU "$app/Runner" | grep -E '_DuanjuRequest|_DuanjuFree' \
+              || { echo "iOS 包缺少 FFI 入口" >&2; exit 1; }
+            echo "===== 打包 app.zip + unsigned ipa ====="
+            mkdir -p dist/ios
+            ditto -c -k --sequesterRsrc --keepParent "$app" \
+              "dist/ios/${slug}-${version}-ios-unsigned-app.zip"
+            rm -rf Payload && mkdir -p Payload
+            cp -a "$app" Payload/
+            ditto -c -k --sequesterRsrc Payload \
+              "dist/ios/${slug}-${version}-ios-unsigned.ipa"
+            rm -rf Payload
+            echo "===== 校验和 ====="
+            cd dist/ios
+            shasum -a 256 "${slug}-${version}-ios-unsigned.ipa" \
+              "${slug}-${version}-ios-unsigned-app.zip" | tee SHA256SUMS.txt
+            ls -la
+          } 2>&1 | tee -a "$log"
 
-      - name: 失败时把报错尾部写入 Summary（运行页面直接可见，无需下载日志）
+      - name: 失败时把报错尾部写入 Summary（运行页面直接可见）
         if: failure()
         run: |
           log="/tmp/ios-build-${{ matrix.edition }}.log"
           {
-            echo "## ${{ matrix.edition }} 构建失败 — 步骤 5 日志最后 150 行"
+            echo "## ${{ matrix.edition }} 构建失败 — 步骤 5a/5b 日志最后 150 行"
             echo '```text'
-            if [ -f "$log" ]; then tail -n 150 "$log"; else echo "步骤 5 未产生日志，失败发生在更早的命名步骤，请看左侧步骤列表"; fi
+            if [ -f "$log" ]; then tail -n 150 "$log"; else echo "步骤 5a 之前就已失败，请看左侧红叉步骤名"; fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
